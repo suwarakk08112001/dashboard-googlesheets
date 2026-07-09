@@ -11,6 +11,10 @@ export class DashboardService implements OnModuleInit {
   private sheetName1: string;
   private sheetName2: string;
 
+  // ── Cache เก็บข้อมูล sheet ในหน่วยความจำ ──
+  private cache = new Map<string, { data: any[][]; fetchedAt: number }>();
+  private readonly CACHE_TTL_MS = 2 * 60 * 1000; // 2 นาที (ปรับได้ตามความถี่ที่ข้อมูลเปลี่ยน)
+
   private readonly logger = new Logger(DashboardService.name);
 
   constructor(private configService: ConfigService) {}
@@ -43,8 +47,6 @@ export class DashboardService implements OnModuleInit {
     this.sheetName = allSheets[1] || 'Sheet1';
     this.sheetName1 = allSheets[2] || 'Sheet2';
     this.sheetName2 = allSheets[3] || 'Sheet3';
-    // this.sheetName1 = allSheets.find((n) => n.includes('รับเข้า')) || '';
-    // this.sheetName2 = allSheets.find((n) => n.includes('จ่ายออก')) || '';
 
     this.logger.log(`✅ เชื่อมต่อสำเร็จ`);
     this.logger.log(`📌 Sheet หลัก: "${this.sheetName}"`);
@@ -52,15 +54,39 @@ export class DashboardService implements OnModuleInit {
     this.logger.log(`📌 Sheet จ่ายออก: "${this.sheetName2}"`);
   }
 
-  async findTotalSKU(): Promise<{ total_of_SKU: number }> {
+  // ─────────────────────────────────────────────
+  //  Cache Layer — ลด API call ไม่ให้ชน quota
+  // ─────────────────────────────────────────────
+
+  /**
+   * ดึงข้อมูล sheet โดยใช้ cache
+   * ถ้าข้อมูลยังไม่หมดอายุ (CACHE_TTL_MS) จะคืนจาก memory ทันทีโดยไม่เรียก API
+   */
+  private async getSheetData(sheetName: string): Promise<any[][]> {
+    const cached = this.cache.get(sheetName);
+    if (cached && Date.now() - cached.fetchedAt < this.CACHE_TTL_MS) {
+      this.logger.debug(`📦 Cache hit: "${sheetName}"`);
+      return cached.data;
+    }
+
+    this.logger.log(`🔄 Fetching from API: "${sheetName}"`);
     const res = await this.sheets.spreadsheets.values.get({
       spreadsheetId: this.spreadsheetId,
-      range: this.sheetName,
+      range: sheetName,
     });
 
-    const rows = res.data.values;
-    if (!rows || rows.length <= 1) return { total_of_SKU: 0 };
+    const data = res.data.values || [];
+    this.cache.set(sheetName, { data, fetchedAt: Date.now() });
+    return data;
+  }
 
+  // ─────────────────────────────────────────────
+  //  API Methods
+  // ─────────────────────────────────────────────
+
+  async findTotalSKU(): Promise<{ total_of_SKU: number }> {
+    const rows = await this.getSheetData(this.sheetName);
+    if (rows.length <= 1) return { total_of_SKU: 0 };
     return { total_of_SKU: rows.length - 1 };
   }
 
@@ -69,18 +95,11 @@ export class DashboardService implements OnModuleInit {
     total_stock_out: number;
     total_stock_value: number;
   }> {
-    const resIn = await this.sheets.spreadsheets.values.get({
-      spreadsheetId: this.spreadsheetId,
-      range: this.sheetName1,
-    });
+    const rowsIn = await this.getSheetData(this.sheetName1);
+    const rowsOut = await this.getSheetData(this.sheetName2);
 
-    const resOut = await this.sheets.spreadsheets.values.get({
-      spreadsheetId: this.spreadsheetId,
-      range: this.sheetName2,
-    });
-
-    const sumColumn = (rows: any[][] | null | undefined): number => {
-      if (!rows || rows.length <= 1) return 0;
+    const sumColumn = (rows: any[][]): number => {
+      if (rows.length <= 1) return 0;
       const headers = rows[0];
       const colIndex = headers.findIndex((h: string) =>
         h.includes('มูลค่ารวม'),
@@ -90,7 +109,6 @@ export class DashboardService implements OnModuleInit {
       return rows
         .slice(1)
         .filter((row) => {
-          // ตัดแถวที่เป็นแถวรวม/สรุป ออก
           const firstCell = String(row[0] || '').trim();
           return firstCell !== '' && !firstCell.includes('รวม');
         })
@@ -102,8 +120,8 @@ export class DashboardService implements OnModuleInit {
         }, 0);
     };
 
-    const totalIn = sumColumn(resIn.data.values);
-    const totalOut = sumColumn(resOut.data.values);
+    const totalIn = sumColumn(rowsIn);
+    const totalOut = sumColumn(rowsOut);
 
     return {
       total_stock_in: totalIn,
@@ -121,15 +139,9 @@ export class DashboardService implements OnModuleInit {
       medSupply: number;
     }[];
   }> {
-    const [resIn, resOut] = await Promise.all([
-      this.sheets.spreadsheets.values.get({
-        spreadsheetId: this.spreadsheetId,
-        range: this.sheetName1,
-      }),
-      this.sheets.spreadsheets.values.get({
-        spreadsheetId: this.spreadsheetId,
-        range: this.sheetName2,
-      }),
+    const [rowsIn, rowsOut] = await Promise.all([
+      this.getSheetData(this.sheetName1),
+      this.getSheetData(this.sheetName2),
     ]);
 
     const now = new Date();
@@ -147,10 +159,10 @@ export class DashboardService implements OnModuleInit {
     };
 
     const aggregateByMonth = (
-      rows: any[][] | null | undefined,
+      rows: any[][],
     ): Map<number, number> => {
       const map = new Map<number, number>();
-      if (!rows || rows.length <= 1) return map;
+      if (rows.length <= 1) return map;
 
       const headers = rows[0];
       const valueColIndex = headers.findIndex((h: string) =>
@@ -183,10 +195,9 @@ export class DashboardService implements OnModuleInit {
       return map;
     };
 
-    const stockInByMonth = aggregateByMonth(resIn.data.values);
-    const stockOutByMonth = aggregateByMonth(resOut.data.values);
+    const stockInByMonth = aggregateByMonth(rowsIn);
+    const stockOutByMonth = aggregateByMonth(rowsOut);
 
-    // เรียงตามลำดับปีงบ: ต.ค.(10) → ก.ย.(9)
     const fiscalMonthOrder = [10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     const months = fiscalMonthOrder.map((month) => {
       const totalIn = stockInByMonth.get(month) || 0;
@@ -205,15 +216,9 @@ export class DashboardService implements OnModuleInit {
   async findTopTenStock(
     dto: SearchDto,
   ): Promise<{ name: string; total: number }[]> {
-    const [resIn, resOut] = await Promise.all([
-      this.sheets.spreadsheets.values.get({
-        spreadsheetId: this.spreadsheetId,
-        range: this.sheetName1,
-      }),
-      this.sheets.spreadsheets.values.get({
-        spreadsheetId: this.spreadsheetId,
-        range: this.sheetName2,
-      }),
+    const [rowsIn, rowsOut] = await Promise.all([
+      this.getSheetData(this.sheetName1),
+      this.getSheetData(this.sheetName2),
     ]);
 
     const now = new Date();
@@ -232,10 +237,10 @@ export class DashboardService implements OnModuleInit {
     };
 
     const aggregate = (
-      rows: any[][] | null | undefined,
+      rows: any[][],
     ): Map<string, number> => {
       const map = new Map<string, number>();
-      if (!rows || rows.length <= 1) return map;
+      if (rows.length <= 1) return map;
 
       const headers = rows[0];
       const nameColIndex = headers.findIndex((h: string) =>
@@ -276,8 +281,8 @@ export class DashboardService implements OnModuleInit {
       return map;
     };
 
-    const stockIn = aggregate(resIn.data.values);
-    const stockOut = aggregate(resOut.data.values);
+    const stockIn = aggregate(rowsIn);
+    const stockOut = aggregate(rowsOut);
 
     const allNames = new Set([...stockIn.keys(), ...stockOut.keys()]);
 
@@ -296,13 +301,8 @@ export class DashboardService implements OnModuleInit {
   async findTopTenTransOut(
     dto: SearchDto,
   ): Promise<{ name: string; total: number }[]> {
-    const res = await this.sheets.spreadsheets.values.get({
-      spreadsheetId: this.spreadsheetId,
-      range: this.sheetName2,
-    });
-
-    const rows = res.data.values;
-    if (!rows || rows.length <= 1) return [];
+    const rows = await this.getSheetData(this.sheetName2);
+    if (rows.length <= 1) return [];
 
     const headers = rows[0];
     const nameColIndex = headers.findIndex((h: string) =>
@@ -316,7 +316,6 @@ export class DashboardService implements OnModuleInit {
     if (nameColIndex === -1 || valueColIndex === -1 || ymColIndex === -1)
       return [];
 
-    // ✅ คำนวณปีงบปัจจุบันให้ถูก
     const now = new Date();
     const currentMonth = now.getMonth() + 1;
     const currentFiscalYear =
